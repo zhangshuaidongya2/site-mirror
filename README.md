@@ -53,6 +53,8 @@ Write output to a custom directory:
 node dist/cli.js mirror https://example.com -o ./snapshots/example
 ```
 
+The repository already ignores `./snapshots`, so you can use it to store downloaded site snapshots locally.
+
 Crawl the current page plus one additional level of in-scope pages:
 
 ```bash

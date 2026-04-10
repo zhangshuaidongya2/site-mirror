@@ -53,6 +53,8 @@ node dist/cli.js mirror https://example.com
 node dist/cli.js mirror https://example.com -o ./snapshots/example
 ```
 
+仓库已经把 `./snapshots` 加进 Git 忽略规则，可以直接用它来存本地拉下来的站点镜像。
+
 抓取当前页面加一层站内页面：
 
 ```bash
