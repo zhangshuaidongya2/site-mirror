@@ -12,8 +12,16 @@ import {
   planLocalRelativePath,
   relativeBrowserPath,
 } from "./pathing.js";
+import {
+  createPlaywrightMirrorClient,
+  type BrowserMirrorClient,
+  type BrowserMirrorClientFactory,
+  type BrowserResourceSnapshot,
+} from "./playwright-support.js";
 import type {
   FailureRecord,
+  MirrorProgress,
+  MirrorProgressPhase,
   MirrorOptions,
   MirrorResult,
   ResourceKind,
@@ -42,6 +50,11 @@ interface Replacement {
   start: number;
   end: number;
   value: string;
+}
+
+interface MirrorEngineDependencies {
+  browserClientFactory?: BrowserMirrorClientFactory;
+  onProgress?: (progress: MirrorProgress) => void;
 }
 
 const NETWORK_HINT_RELS = new Set(["dns-prefetch", "preconnect", "prerender"]);
@@ -147,9 +160,14 @@ export class MirrorEngine {
   private readonly limit;
   private readonly usedPaths = new Map<string, string>();
   private readonly client;
+  private readonly activeRecords = new Set<string>();
+  private browserClientPromise?: Promise<BrowserMirrorClient>;
   private entryUrl!: URL;
 
-  constructor(private readonly options: MirrorOptions) {
+  constructor(
+    private readonly options: MirrorOptions,
+    private readonly dependencies: MirrorEngineDependencies = {},
+  ) {
     this.limit = pLimit(Math.max(1, options.concurrency));
     this.client = got.extend({
       followRedirect: true,
@@ -172,39 +190,45 @@ export class MirrorEngine {
       throw new Error("Only http:// and https:// URLs are supported.");
     }
 
-    this.entryUrl = entryUrl;
-    await fs.mkdir(this.options.outputDir, { recursive: true });
+    try {
+      this.entryUrl = entryUrl;
+      await fs.mkdir(this.options.outputDir, { recursive: true });
+      this.emitProgress("starting");
 
-    const entryRecord = this.enqueueResource(entryUrl, "page", 0);
-    if (!entryRecord) {
-      throw new Error("Failed to enqueue the entry page.");
+      const entryRecord = this.enqueueResource(entryUrl, "page", 0);
+      if (!entryRecord) {
+        throw new Error("Failed to enqueue the entry page.");
+      }
+
+      for (let index = 0; index < this.tasks.length; index += 1) {
+        await this.tasks[index];
+      }
+
+      if (entryRecord.status === "failed") {
+        throw new Error(entryRecord.error ?? "Entry page download failed.");
+      }
+
+      const launcherFile = await this.writeLauncher(entryRecord);
+      const reportFile = await this.writeReport(entryRecord);
+      const records = [...this.records.values()].sort((left, right) =>
+        left.localRelativePath.localeCompare(right.localRelativePath),
+      );
+      this.emitProgress("finished", entryRecord);
+
+      return {
+        entryUrl: entryUrl.toString(),
+        outputDir: this.options.outputDir,
+        launcherFile,
+        entryFile: entryRecord.localAbsolutePath,
+        reportFile,
+        downloadedCount: records.filter((record) => record.status === "done").length,
+        failedCount: this.failures.length,
+        records,
+        failures: [...this.failures],
+      };
+    } finally {
+      await this.closeBrowserClient();
     }
-
-    for (let index = 0; index < this.tasks.length; index += 1) {
-      await this.tasks[index];
-    }
-
-    if (entryRecord.status === "failed") {
-      throw new Error(entryRecord.error ?? "Entry page download failed.");
-    }
-
-    const launcherFile = await this.writeLauncher(entryRecord);
-    const reportFile = await this.writeReport(entryRecord);
-    const records = [...this.records.values()].sort((left, right) =>
-      left.localRelativePath.localeCompare(right.localRelativePath),
-    );
-
-    return {
-      entryUrl: entryUrl.toString(),
-      outputDir: this.options.outputDir,
-      launcherFile,
-      entryFile: entryRecord.localAbsolutePath,
-      reportFile,
-      downloadedCount: records.filter((record) => record.status === "done").length,
-      failedCount: this.failures.length,
-      records,
-      failures: [...this.failures],
-    };
   }
 
   private enqueueResource(
@@ -255,39 +279,19 @@ export class MirrorEngine {
 
     this.records.set(key, record);
     this.tasks.push(this.limit(() => this.processResource(record)));
+    this.emitProgress("queued", record);
     return record;
   }
 
   private async processResource(record: ResourceRecord): Promise<void> {
+    this.activeRecords.add(record.key);
+    this.emitProgress("fetching", record);
+
     try {
-      const response = await this.client.get(record.url, {
-        headers: record.parentUrl ? { referer: record.parentUrl } : undefined,
-        responseType: "buffer",
-      });
-
-      const body = Buffer.isBuffer(response.body)
-        ? response.body
-        : Buffer.from(response.body);
-      const finalUrl = new URL(response.url);
-      const contentType = String(response.headers["content-type"] ?? "");
-
-      record.finalUrl = finalUrl.toString();
-      record.contentType = contentType;
-      record.size = body.length;
-
-      await fs.mkdir(path.dirname(record.localAbsolutePath), { recursive: true });
-
-      const mode = classifyContentAsText(record.kind, contentType);
-      if (mode === "html") {
-        const html = decodeBuffer(body, contentType);
-        const rewritten = await this.rewriteHtml(record, html, finalUrl);
-        await fs.writeFile(record.localAbsolutePath, rewritten, "utf8");
-      } else if (mode === "css") {
-        const css = decodeBuffer(body, contentType);
-        const rewritten = await this.rewriteCssText(record, css, finalUrl);
-        await fs.writeFile(record.localAbsolutePath, rewritten, "utf8");
+      if (this.options.mode === "playwright") {
+        await this.processResourceWithPlaywright(record);
       } else {
-        await fs.writeFile(record.localAbsolutePath, body);
+        await this.processResourceWithHttp(record);
       }
 
       record.status = "done";
@@ -301,7 +305,94 @@ export class MirrorEngine {
         message: record.error,
       });
       this.log(`failed ${record.url}: ${record.error}`);
+    } finally {
+      this.activeRecords.delete(record.key);
+      this.emitProgress("processed", record);
     }
+  }
+
+  private async processResourceWithHttp(record: ResourceRecord): Promise<void> {
+    const response = await this.client.get(record.url, {
+      headers: record.parentUrl ? { referer: record.parentUrl } : undefined,
+      responseType: "buffer",
+    });
+
+    const body = Buffer.isBuffer(response.body)
+      ? response.body
+      : Buffer.from(response.body);
+
+    await this.writeProcessedResponse(record, {
+      body,
+      contentType: String(response.headers["content-type"] ?? ""),
+      finalUrl: response.url,
+    });
+  }
+
+  private async processResourceWithPlaywright(record: ResourceRecord): Promise<void> {
+    const browserClient = await this.getBrowserClient();
+
+    if (record.kind === "page" || record.kind === "document") {
+      const snapshot = await browserClient.renderPage({
+        url: record.url,
+        referer: record.parentUrl,
+      });
+
+      await this.writeProcessedPage(record, snapshot.html, snapshot.finalUrl, snapshot.contentType);
+      return;
+    }
+
+    const snapshot = await browserClient.fetchResource({
+      url: record.url,
+      referer: record.parentUrl,
+    });
+
+    await this.writeProcessedResponse(record, snapshot);
+  }
+
+  private async writeProcessedResponse(
+    record: ResourceRecord,
+    response: BrowserResourceSnapshot,
+  ): Promise<void> {
+    const finalUrl = new URL(response.finalUrl);
+    const contentType = response.contentType;
+    const body = response.body;
+
+    record.finalUrl = finalUrl.toString();
+    record.contentType = contentType;
+    record.size = body.length;
+
+    await fs.mkdir(path.dirname(record.localAbsolutePath), { recursive: true });
+
+    const mode = classifyContentAsText(record.kind, contentType);
+    if (mode === "html") {
+      const html = decodeBuffer(body, contentType);
+      const rewritten = await this.rewriteHtml(record, html, finalUrl);
+      await fs.writeFile(record.localAbsolutePath, rewritten, "utf8");
+    } else if (mode === "css") {
+      const css = decodeBuffer(body, contentType);
+      const rewritten = await this.rewriteCssText(record, css, finalUrl);
+      await fs.writeFile(record.localAbsolutePath, rewritten, "utf8");
+    } else {
+      await fs.writeFile(record.localAbsolutePath, body);
+    }
+  }
+
+  private async writeProcessedPage(
+    record: ResourceRecord,
+    html: string,
+    finalUrlInput: string,
+    contentType: string,
+  ): Promise<void> {
+    const finalUrl = new URL(finalUrlInput);
+
+    record.finalUrl = finalUrl.toString();
+    record.contentType = contentType;
+    record.size = Buffer.byteLength(html);
+
+    await fs.mkdir(path.dirname(record.localAbsolutePath), { recursive: true });
+
+    const rewritten = await this.rewriteHtml(record, html, finalUrl);
+    await fs.writeFile(record.localAbsolutePath, rewritten, "utf8");
   }
 
   private async rewriteHtml(record: ResourceRecord, html: string, pageUrl: URL): Promise<string> {
@@ -916,5 +1007,51 @@ export class MirrorEngine {
     if (this.options.verbose) {
       console.log(message);
     }
+  }
+
+  private async getBrowserClient(): Promise<BrowserMirrorClient> {
+    if (!this.browserClientPromise) {
+      const factory =
+        this.dependencies.browserClientFactory ?? createPlaywrightMirrorClient;
+      this.browserClientPromise = factory(this.options);
+    }
+
+    return this.browserClientPromise;
+  }
+
+  private async closeBrowserClient(): Promise<void> {
+    if (!this.browserClientPromise) {
+      return;
+    }
+
+    try {
+      const browserClient = await this.browserClientPromise;
+      await browserClient.close();
+    } catch {
+      // Ignore browser bootstrap and shutdown failures during cleanup.
+    } finally {
+      this.browserClientPromise = undefined;
+    }
+  }
+
+  private emitProgress(
+    phase: MirrorProgressPhase,
+    record?: ResourceRecord,
+  ): void {
+    this.dependencies.onProgress?.({
+      phase,
+      discoveredCount: this.records.size,
+      pendingCount: [...this.records.values()].filter(
+        (resource) =>
+          resource.status === "pending" && !this.activeRecords.has(resource.key),
+      ).length,
+      inProgressCount: this.activeRecords.size,
+      downloadedCount: [...this.records.values()].filter(
+        (resource) => resource.status === "done",
+      ).length,
+      failedCount: this.failures.length,
+      currentUrl: record?.url,
+      currentKind: record?.kind,
+    });
   }
 }

@@ -5,7 +5,15 @@ import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 
 import { MirrorEngine } from "./mirror.js";
-import type { MirrorOptions, ScopeMode } from "./types.js";
+import type {
+  MirrorProgress,
+  MirrorMode,
+  MirrorOptions,
+  MirrorResult,
+  PlaywrightBrowser,
+  PlaywrightWaitUntil,
+  ScopeMode,
+} from "./types.js";
 import { DEFAULT_USER_AGENT } from "./utils.js";
 
 function parseInteger(name: string, minimum: number) {
@@ -27,6 +35,133 @@ function parseScope(value: string): ScopeMode {
   throw new InvalidArgumentError(
     "scope must be one of: same-origin, same-host, all",
   );
+}
+
+function parseMode(value: string): MirrorMode {
+  if (value === "http" || value === "playwright") {
+    return value;
+  }
+
+  throw new InvalidArgumentError("mode must be one of: http, playwright");
+}
+
+function parsePlaywrightBrowser(value: string): PlaywrightBrowser {
+  if (value === "chromium" || value === "firefox" || value === "webkit") {
+    return value;
+  }
+
+  throw new InvalidArgumentError(
+    "playwright browser must be one of: chromium, firefox, webkit",
+  );
+}
+
+function parsePlaywrightWaitUntil(value: string): PlaywrightWaitUntil {
+  if (
+    value === "domcontentloaded" ||
+    value === "load" ||
+    value === "networkidle"
+  ) {
+    return value;
+  }
+
+  throw new InvalidArgumentError(
+    "playwright wait-until must be one of: domcontentloaded, load, networkidle",
+  );
+}
+
+function truncateMiddle(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  const head = Math.max(0, Math.floor((maxLength - 3) / 2));
+  const tail = Math.max(0, maxLength - 3 - head);
+  return `${value.slice(0, head)}...${value.slice(value.length - tail)}`;
+}
+
+function formatProgress(progress: MirrorProgress): string {
+  const parts = [
+    `found ${progress.discoveredCount}`,
+    `active ${progress.inProgressCount}`,
+    `done ${progress.downloadedCount}`,
+  ];
+
+  if (progress.pendingCount > 0) {
+    parts.push(`pending ${progress.pendingCount}`);
+  }
+
+  if (progress.failedCount > 0) {
+    parts.push(`failed ${progress.failedCount}`);
+  }
+
+  if (progress.currentUrl) {
+    const kind = progress.currentKind ? `${progress.currentKind} ` : "";
+    parts.push(`${kind}${truncateMiddle(progress.currentUrl, 72)}`);
+  }
+
+  return `Progress: ${parts.join(", ")}`;
+}
+
+function createProgressReporter(input: {
+  url: string;
+  outputDir: string;
+  mode: MirrorMode;
+}) {
+  let latest: MirrorProgress | null = null;
+  let lastRenderedLine = "";
+  let timer: NodeJS.Timeout | undefined;
+
+  const isInteractive = Boolean(process.stderr.isTTY);
+
+  const render = (force = false) => {
+    if (!latest) {
+      return;
+    }
+
+    const line = formatProgress(latest);
+    if (!force && line === lastRenderedLine) {
+      return;
+    }
+
+    if (isInteractive) {
+      const padded = line.padEnd(lastRenderedLine.length, " ");
+      process.stderr.write(`\r${padded}`);
+      lastRenderedLine = line;
+      return;
+    }
+
+    process.stderr.write(`${line}\n`);
+    lastRenderedLine = line;
+  };
+
+  return {
+    start() {
+      process.stderr.write(
+        `Starting mirror: ${input.url}\nMode: ${input.mode}\nOutput: ${input.outputDir}\n`,
+      );
+      timer = setInterval(() => render(false), 1000);
+      timer.unref();
+    },
+
+    update(progress: MirrorProgress) {
+      latest = progress;
+      if (progress.phase === "starting" || progress.phase === "fetching") {
+        render(false);
+      }
+    },
+
+    stop() {
+      if (timer) {
+        clearInterval(timer);
+      }
+
+      render(true);
+
+      if (isInteractive && lastRenderedLine.length > 0) {
+        process.stderr.write("\n");
+      }
+    },
+  };
 }
 
 async function main(): Promise<void> {
@@ -80,6 +215,30 @@ async function main(): Promise<void> {
       parseScope,
       "all",
     )
+    .option(
+      "--mode <mode>",
+      "Mirroring mode: http, playwright",
+      parseMode,
+      "http",
+    )
+    .option(
+      "--playwright-browser <name>",
+      "Playwright browser engine: chromium, firefox, webkit",
+      parsePlaywrightBrowser,
+      "chromium",
+    )
+    .option(
+      "--playwright-wait-until <state>",
+      "Playwright navigation wait state: domcontentloaded, load, networkidle",
+      parsePlaywrightWaitUntil,
+      "load",
+    )
+    .option(
+      "--playwright-wait-ms <ms>",
+      "Extra delay after Playwright navigation completes",
+      parseInteger("playwright-wait-ms", 0),
+      1000,
+    )
     .option("--user-agent <ua>", "HTTP User-Agent", DEFAULT_USER_AGENT)
     .option("--keep-integrity", "Keep SRI attributes instead of stripping them")
     .option("--verbose", "Print saved files as they are mirrored")
@@ -93,12 +252,32 @@ async function main(): Promise<void> {
         pageScope: commandOptions.pageScope,
         assetScope: commandOptions.assetScope,
         userAgent: commandOptions.userAgent,
+        mode: commandOptions.mode,
+        playwrightBrowser: commandOptions.playwrightBrowser,
+        playwrightWaitUntil: commandOptions.playwrightWaitUntil,
+        playwrightWaitMs: commandOptions.playwrightWaitMs,
         verbose: Boolean(commandOptions.verbose),
         stripIntegrity: !commandOptions.keepIntegrity,
       };
 
-      const engine = new MirrorEngine(options);
-      const result = await engine.mirror(url);
+      const progressReporter = createProgressReporter({
+        url,
+        outputDir: options.outputDir,
+        mode: options.mode,
+      });
+      const engine = new MirrorEngine(options, {
+        onProgress: (progress) => {
+          progressReporter.update(progress);
+        },
+      });
+      progressReporter.start();
+
+      let result: MirrorResult;
+      try {
+        result = await engine.mirror(url);
+      } finally {
+        progressReporter.stop();
+      }
 
       console.log(`Entry: ${result.entryUrl}`);
       console.log(`Launcher: ${result.launcherFile}`);

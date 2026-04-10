@@ -13,6 +13,7 @@
 - 重写 HTML 中的 `src`、`href`、`srcset`、内联 `style`
 - 重写 CSS 中的 `@import` 和 `url(...)`
 - 可按深度抓取同域页面，并把页面链接改写为本地文件
+- 可选 Playwright 模式，先渲染 JS 页面再镜像
 - 自动生成离线入口文件 `index.html`
 - 生成 `mirror-report.json` 报告
 
@@ -61,6 +62,16 @@ node dist/cli.js mirror https://example.com -o ./snapshots/example
 node dist/cli.js mirror https://example.com --depth 1
 ```
 
+对 JS 较重的页面，可以先用 Playwright 渲染再镜像：
+
+```bash
+npm install playwright
+npx playwright install chromium
+node dist/cli.js mirror https://example.com -o ./snapshots/example --mode playwright
+```
+
+Playwright 模式是可选能力。它会先在真实浏览器里渲染页面，再进行资源改写和落盘，对动态站点更有帮助，但依然不能保证绕过登录、风控、验证码或服务端限制。
+
 ## 常用参数
 
 - `-o, --output <dir>` 输出目录
@@ -70,6 +81,10 @@ node dist/cli.js mirror https://example.com --depth 1
 - `--retries <number>` 失败重试次数，默认 `2`
 - `--page-scope <scope>` 页面抓取范围：`same-origin`、`same-host`、`all`
 - `--asset-scope <scope>` 静态资源抓取范围：`same-origin`、`same-host`、`all`
+- `--mode <mode>` 镜像模式：`http`、`playwright`
+- `--playwright-browser <name>` Playwright 模式使用的浏览器内核：`chromium`、`firefox`、`webkit`
+- `--playwright-wait-until <state>` Playwright 模式的导航等待时机：`domcontentloaded`、`load`、`networkidle`
+- `--playwright-wait-ms <ms>` Playwright 导航完成后的额外等待时间，默认 `1000`
 - `--user-agent <ua>` 自定义 HTTP `User-Agent`
 - `--keep-integrity` 保留 SRI 属性，默认会移除被本地重写资源上的 `integrity`
 - `--verbose` 输出下载过程

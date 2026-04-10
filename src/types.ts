@@ -9,6 +9,15 @@ export type ResourceKind =
   | "other";
 
 export type ScopeMode = "same-origin" | "same-host" | "all";
+export type MirrorMode = "http" | "playwright";
+export type PlaywrightBrowser = "chromium" | "firefox" | "webkit";
+export type PlaywrightWaitUntil = "domcontentloaded" | "load" | "networkidle";
+export type MirrorProgressPhase =
+  | "starting"
+  | "queued"
+  | "fetching"
+  | "processed"
+  | "finished";
 
 export interface MirrorOptions {
   outputDir: string;
@@ -19,8 +28,23 @@ export interface MirrorOptions {
   pageScope: ScopeMode;
   assetScope: ScopeMode;
   userAgent: string;
+  mode: MirrorMode;
+  playwrightBrowser: PlaywrightBrowser;
+  playwrightWaitUntil: PlaywrightWaitUntil;
+  playwrightWaitMs: number;
   verbose: boolean;
   stripIntegrity: boolean;
+}
+
+export interface MirrorProgress {
+  phase: MirrorProgressPhase;
+  discoveredCount: number;
+  pendingCount: number;
+  inProgressCount: number;
+  downloadedCount: number;
+  failedCount: number;
+  currentUrl?: string;
+  currentKind?: ResourceKind;
 }
 
 export interface ResourceRecord {

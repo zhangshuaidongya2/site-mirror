@@ -13,6 +13,7 @@ Give it a URL and it will download the page HTML, CSS, JS, images, fonts, media,
 - Rewrite HTML `src`, `href`, `srcset`, and inline `style` references
 - Rewrite CSS `@import` and `url(...)` references
 - Optionally crawl additional HTML pages by depth and rewrite page links to local files
+- Optional Playwright mode for rendering JS-driven pages before mirroring
 - Generate an offline launcher `index.html`
 - Generate a `mirror-report.json` report
 
@@ -61,6 +62,16 @@ Crawl the current page plus one additional level of in-scope pages:
 node dist/cli.js mirror https://example.com --depth 1
 ```
 
+Render JS-driven pages with Playwright before rewriting and saving them:
+
+```bash
+npm install playwright
+npx playwright install chromium
+node dist/cli.js mirror https://example.com -o ./snapshots/example --mode playwright
+```
+
+Playwright mode is optional. It renders pages in a real browser first, which helps with JS-heavy sites, but it still cannot guarantee success against login walls, anti-bot checks, or server-side protections.
+
 ## Common Options
 
 - `-o, --output <dir>` Output directory
@@ -70,6 +81,10 @@ node dist/cli.js mirror https://example.com --depth 1
 - `--retries <number>` Retry count for failed requests, default `2`
 - `--page-scope <scope>` HTML crawl scope: `same-origin`, `same-host`, `all`
 - `--asset-scope <scope>` Asset download scope: `same-origin`, `same-host`, `all`
+- `--mode <mode>` Mirroring mode: `http`, `playwright`
+- `--playwright-browser <name>` Browser engine for Playwright mode: `chromium`, `firefox`, `webkit`
+- `--playwright-wait-until <state>` Navigation wait state for Playwright mode: `domcontentloaded`, `load`, `networkidle`
+- `--playwright-wait-ms <ms>` Extra delay after Playwright navigation, default `1000`
 - `--user-agent <ua>` Custom HTTP `User-Agent`
 - `--keep-integrity` Keep SRI attributes instead of removing them after local rewrites
 - `--verbose` Print saved files while mirroring

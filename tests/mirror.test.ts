@@ -7,6 +7,7 @@ import { load } from "cheerio";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { MirrorEngine } from "../src/mirror.js";
+import type { BrowserMirrorClient } from "../src/playwright-support.js";
 import type { MirrorOptions } from "../src/types.js";
 import { DEFAULT_USER_AGENT } from "../src/utils.js";
 
@@ -176,8 +177,83 @@ function makeOptions(outputDir: string, crawlDepth: number): MirrorOptions {
     pageScope: "same-origin",
     assetScope: "all",
     userAgent: DEFAULT_USER_AGENT,
+    mode: "http",
+    playwrightBrowser: "chromium",
+    playwrightWaitUntil: "load",
+    playwrightWaitMs: 1000,
     verbose: false,
     stripIntegrity: true,
+  };
+}
+
+function createFakeBrowserClient(): BrowserMirrorClient {
+  return {
+    async renderPage({
+      url,
+    }: {
+      url: string;
+      referer?: string;
+    }) {
+      const target = new URL(url);
+
+      switch (target.pathname) {
+        case "/dynamic/index.html":
+          return {
+            finalUrl: target.toString(),
+            contentType: "text/html; charset=utf-8",
+            html: `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Dynamic</title>
+  </head>
+  <body>
+    <div id="app">Rendered content</div>
+    <img id="dynamic-logo" src="/images/logo.png">
+    <a id="dynamic-link" href="/dynamic/about.html">Dynamic About</a>
+  </body>
+</html>`,
+          };
+        case "/dynamic/about.html":
+          return {
+            finalUrl: target.toString(),
+            contentType: "text/html; charset=utf-8",
+            html: `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Dynamic About</title>
+  </head>
+  <body>
+    <img id="about-image" src="/images/about.png">
+  </body>
+</html>`,
+          };
+        default:
+          throw new Error(`Unhandled rendered page: ${target.pathname}`);
+      }
+    },
+
+    async fetchResource({
+      url,
+    }: {
+      url: string;
+      referer?: string;
+    }) {
+      const target = new URL(url);
+      const route = routes[target.pathname];
+      if (!route) {
+        throw new Error(`Unhandled resource: ${target.pathname}`);
+      }
+
+      return {
+        finalUrl: target.toString(),
+        contentType: route.contentType,
+        body: Buffer.isBuffer(route.body) ? route.body : Buffer.from(route.body),
+      };
+    },
+
+    async close(): Promise<void> {},
   };
 }
 
@@ -287,6 +363,81 @@ describe("MirrorEngine", () => {
     const iframeSrc = $("#frame").attr("src");
     expect(iframeSrc?.startsWith("http")).toBe(false);
     expect(await fileExists(resolveLocalReference(result.entryFile, iframeSrc!))).toBe(true);
+
+    await fs.rm(outputDir, { recursive: true, force: true });
+  });
+
+  it("can mirror rendered pages through the Playwright mode", async () => {
+    const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "site-mirror-"));
+    const options: MirrorOptions = {
+      ...makeOptions(outputDir, 1),
+      mode: "playwright",
+      playwrightWaitMs: 0,
+    };
+    const engine = new MirrorEngine(options, {
+      browserClientFactory: async () => createFakeBrowserClient(),
+    });
+
+    const result = await engine.mirror(`${baseUrl}/dynamic/index.html`);
+    const entryHtml = await fs.readFile(result.entryFile, "utf8");
+    const $ = load(entryHtml);
+
+    expect(result.failedCount).toBe(0);
+    expect($("#app").text()).toBe("Rendered content");
+
+    const imageSrc = $("#dynamic-logo").attr("src");
+    expect(imageSrc?.startsWith("http")).toBe(false);
+    expect(await fileExists(resolveLocalReference(result.entryFile, imageSrc!))).toBe(
+      true,
+    );
+
+    const aboutHref = $("#dynamic-link").attr("href");
+    expect(aboutHref?.startsWith("http")).toBe(false);
+    expect(await fileExists(resolveLocalReference(result.entryFile, aboutHref!))).toBe(true);
+
+    const aboutHtml = await fs.readFile(
+      resolveLocalReference(result.entryFile, aboutHref!),
+      "utf8",
+    );
+    expect(aboutHtml).toContain("about-image");
+
+    await fs.rm(outputDir, { recursive: true, force: true });
+  });
+
+  it("reports progress snapshots while mirroring", async () => {
+    const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "site-mirror-"));
+    const snapshots: Array<{
+      phase: string;
+      discoveredCount: number;
+      inProgressCount: number;
+      downloadedCount: number;
+    }> = [];
+    const engine = new MirrorEngine(makeOptions(outputDir, 1), {
+      onProgress: (progress) => {
+        snapshots.push({
+          phase: progress.phase,
+          discoveredCount: progress.discoveredCount,
+          inProgressCount: progress.inProgressCount,
+          downloadedCount: progress.downloadedCount,
+        });
+      },
+    });
+
+    const result = await engine.mirror(`${baseUrl}/index.html`);
+
+    expect(result.failedCount).toBe(0);
+    expect(snapshots.some((snapshot) => snapshot.phase === "starting")).toBe(true);
+    expect(
+      snapshots.some(
+        (snapshot) =>
+          snapshot.phase === "fetching" && snapshot.inProgressCount > 0,
+      ),
+    ).toBe(true);
+
+    const finished = snapshots.at(-1);
+    expect(finished?.phase).toBe("finished");
+    expect(finished?.discoveredCount).toBe(result.records.length);
+    expect(finished?.downloadedCount).toBe(result.downloadedCount);
 
     await fs.rm(outputDir, { recursive: true, force: true });
   });
